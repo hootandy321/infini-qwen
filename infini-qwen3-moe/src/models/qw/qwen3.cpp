@@ -770,41 +770,29 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     }
     
     // if (g_debug_enabled && idev == 0) {
-    //     printf("✓ All tensor buffers allocated successfully\n");
     //     printf("  Memory pool usage: %.2f MB total needed\n", total_memory_needed / (1024.0 * 1024.0));
         
-    //     // Create output directory for debug files
     //     #ifdef _WIN32
-    //     _mkdir("output");
     //     #else
-    //     mkdir("output", 0755);
     //     #endif
-    //     printf("✓ Debug output directory created/verified\n");
     // }
 
 
-            // 在输入嵌入查找之前添加调试
     // if (g_debug_enabled && idev == 0) {
-    //     printf("DEBUG: ===== INPUT EMBEDDING DEBUG =====\n");
-    //     printf("DEBUG: Input tokens (first 10): ");
     //     for (uint32_t i = 0; i < std::min(ntok, 10u); i++) {
     //         printf("%u ", tokens[i]);
     //     }
     //     printf("\n");
-    //     printf("DEBUG: Current configuration:\n");
     //     printf("  meta.dt_logits: %d\n", meta.dt_logits);
     //     printf("  dt_logits (local): %d\n", dt_logits);
     //     printf("  INFINI_DTYPE_F16: %d\n", INFINI_DTYPE_F16);
     //     printf("  INFINI_DTYPE_F32: %d\n", INFINI_DTYPE_F32);
     //     printf("  Weight embedding dtype: %d\n", rsrc.w_in_embd->dtype());
         
-    //     printf("DEBUG: Model info - vocab_size:%zu, d:%zu, ntok:%u\n", meta.dvoc, d, ntok);
-    //     printf("DEBUG: Input embedding tensor info:\n");
     //     printf("  - Pointer: %p\n", rsrc.w_in_embd.get());
     //     printf("  - Data pointer: %p\n", rsrc.w_in_embd->data());
     //     printf("  - Dtype: %d\n", rsrc.w_in_embd->dtype());
 
-    //             // 添加数据类型解释
     //     printf("  - Dtype meaning: ");
     //     switch(rsrc.w_in_embd->dtype()) {
     //         case INFINI_DTYPE_F16: printf("FLOAT16 (2 bytes)"); break;
@@ -823,12 +811,10 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     //     }
     //     printf("\n");
         
-        // 检查第一个 token 的嵌入值（从设备内存复制一小部分来检查）
         if (tokens[0] < meta.dvoc) {
             printf("DEBUG: Checking embedding for token %u:\n", tokens[0]);
             
             if (rsrc.w_in_embd->dtype() == INFINI_DTYPE_F16) {
-                // 使用 FP16 读取
                 std::vector<uint16_t> temp_embedding_raw(std::min(size_t(10), d));
                 size_t token_offset = tokens[0] * d;
                 
@@ -853,7 +839,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
                 }
                 printf("\n");
             } else {
-                // 原有的 float32 处理
                 std::vector<float> temp_embedding(std::min(size_t(10), d));
                 size_t token_offset = tokens[0] * d;
                 
@@ -947,7 +932,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
             }
             printf("\n");
         } else {
-            // 原有的 float32 处理
             std::vector<float> result_check(std::min(size_t(10), d));
             RUN_INFINI(infinirtMemcpy(result_check.data(), 
                                      logits_in->data(0),
@@ -1773,7 +1757,7 @@ workspace_size = std::max(workspace_size, temp_size);
             rsrc.w_attn_o_proj[layer]->data(), 
             1.0, idev == 0 ? 1.0 : 0.0, stream)); 
             // 残差：仅 rank 0 添加原始输入
-            //如果每个设备都添加完整的残差，最终结果会是：output = partial_outputs + ndev * residual  ❌ 错误！
+            // 如果每个设备都添加完整的残差，最终结果会是：output = partial_outputs + ndev * residual (错误)
 
         /*
          * 用于多设备推理的分布式 All-Reduce
@@ -2056,8 +2040,8 @@ workspace_size = std::max(workspace_size, temp_size);
     infiniopDestroyGemmDescriptor(desc_attn_o);               // 注意力输出投影
     infiniopDestroyRoPEDescriptor(desc_rope_q_single);               // 查询的 RoPE
     infiniopDestroyRoPEDescriptor(desc_rope_k_single);               // 键的 RoPE
-    infiniopDestroyRMSNormDescriptor(desc_q_norm_single);     // 单头查询归一化 ✅ 添加这行
-    infiniopDestroyRMSNormDescriptor(desc_k_norm_single);     // 单头键归一化 ✅ 添加这行
+    infiniopDestroyRMSNormDescriptor(desc_q_norm_single);     // 单头查询归一化
+    infiniopDestroyRMSNormDescriptor(desc_k_norm_single);     // 单头键归一化
     
     
     // 清理每请求注意力描述符

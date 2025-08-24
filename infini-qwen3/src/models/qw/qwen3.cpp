@@ -331,7 +331,6 @@ void save_tensor_debug_f16(const std::shared_ptr<Tensor> &tensor, const std::str
 
 void save_tensor_debug_f32(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
                           int layer = -1, const std::string &prefix = "cpp") {
-    save_tensor_debug<float>(tensor, name, layer, prefix);
 }
 
 
@@ -564,40 +563,9 @@ void releaseQwen3DeviceResource(DeviceQwen3Resource &res) {
 }
 
 /*
- * 设备级批处理推理函数
- * 在单个设备上为一批序列执行 transformer 推理。
- * 实现完整的前向传递，包括：
- *  1. 输入嵌入查找和 RoPE 位置编码
- *  2. 多层 transformer 块（注意力 + FFN）
- *  3. 输出归一化和概率分布
- *  4. 带温度/top-k/top-p 的 token 采样
- * 
- * 此函数通过张量并行处理分布式推理，其中
- * 每个设备处理模型参数的一个切片。
- * 
- * 输入参数：
- * - meta：模型架构元数据（维度、层数等）
- * - rsrc：设备资源（权重、句柄、内存池）
- * - idev/ndev：用于分布式推理的设备索引和设备总数
- * - tokens：要处理的输入 token ID [ntok]
- * - ntok：批处理中所有请求的 token 总数
- * - req_lens：每个请求的长度 [nreq] 
- * - nreq：批处理中的请求数
- * - req_pos：每个请求在 KV 缓存中的起始位置 [nreq]
- * - kv_caches：每个请求的 KV 缓存存储 [nreq][ndev][nlayer]
- * - temperature/topk/topp：采样参数 [nreq]
- * - output：生成的 token ID [nreq]
- * 
- * 张量维度符号：
- * - ntok：批处理中的 token 总数
- * - nreq：请求数  
- * - d：模型隐藏维度
- * - nh：总注意力头数
- * - nkvh：总键值头数  
- * - dh：头维度（d/nh）
- * - di：FFN 中间维度
- * - dvoc：词汇表大小
- * - dctx：最大上下文长度
+ * Device-level batch inference function
+ * Performs transformer inference for a batch of sequences on a single device.
+ * Supports tensor parallelism where each device processes a slice of model parameters.
  */
 void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
                       uint32_t idev, uint32_t ndev,
@@ -734,92 +702,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     }
 
 
-            // 在输入嵌入查找之前添加调试 - 写入文件而不是命令行
-    if (g_debug_enabled && idev == 0) {
-        std::ostringstream oss;
-        oss << "DEBUG: ===== INPUT EMBEDDING DEBUG =====\n"
-            << "DEBUG: Input tokens (first 10): ";
-        for (uint32_t i = 0; i < std::min(ntok, 10u); i++) {
-            oss << tokens[i] << " ";
-        }
-        oss << "\nDEBUG: Current configuration:\n"
-            << "  meta.dt_logits: " << meta.dt_logits << "\n"
-            << "  dt_logits (local): " << dt_logits << "\n"
-            << "  INFINI_DTYPE_F16: " << INFINI_DTYPE_F16 << "\n"
-            << "  INFINI_DTYPE_F32: " << INFINI_DTYPE_F32 << "\n"
-            << "  Weight embedding dtype: " << rsrc.w_in_embd->dtype() << "\n"
-            << "DEBUG: Model info - vocab_size:" << meta.dvoc << ", d:" << d << ", ntok:" << ntok << "\n"
-            << "DEBUG: Input embedding tensor info:\n"
-            << "  - Pointer: " << rsrc.w_in_embd.get() << "\n"
-            << "  - Data pointer: " << rsrc.w_in_embd->data() << "\n"
-            << "  - Dtype: " << rsrc.w_in_embd->dtype() << "\n";
 
-        // 添加数据类型解释
-        oss << "  - Dtype meaning: ";
-        switch(rsrc.w_in_embd->dtype()) {
-            case INFINI_DTYPE_F16: oss << "FLOAT16 (2 bytes)"; break;
-            case INFINI_DTYPE_BF16: oss << "BFLOAT16 (2 bytes)"; break; 
-            case INFINI_DTYPE_F32: oss << "FLOAT32 (4 bytes)"; break;
-            case INFINI_DTYPE_I32: oss << "INT32 (4 bytes)"; break;
-            case INFINI_DTYPE_U32: oss << "UINT32 (4 bytes)"; break;
-            default: oss << "UNKNOWN(" << rsrc.w_in_embd->dtype() << ")"; break;
-        }
-        oss << "\n  - Shape: ";
-        auto in_shape = rsrc.w_in_embd->shape();
-        for (size_t i = 0; i < in_shape.size(); i++) {
-            oss << in_shape[i] << (i < in_shape.size()-1 ? "x" : "");
-        }
-        oss << "\n";
-        write_debug_log(oss.str());
-        
-        // 检查第一个 token 的嵌入值
-        if (tokens[0] < meta.dvoc) {
-            std::ostringstream embedding_oss;
-            embedding_oss << "DEBUG: Checking embedding for token " << tokens[0] << ":\n";
-            
-            if (rsrc.w_in_embd->dtype() == INFINI_DTYPE_F16) {
-                // 使用 FP16 读取
-                std::vector<uint16_t> temp_embedding_raw(std::min(size_t(10), d));
-                size_t token_offset = tokens[0] * d;
-                
-                RUN_INFINI(infinirtMemcpy(temp_embedding_raw.data(), 
-                                         rsrc.w_in_embd->data(token_offset),
-                                         sizeof(uint16_t) * temp_embedding_raw.size(), 
-                                         INFINIRT_MEMCPY_D2H));
-                RUN_INFINI(infinirtDeviceSynchronize());
-                
-                embedding_oss << "  First 10 embedding values (FP16 as hex): ";
-                for (size_t i = 0; i < temp_embedding_raw.size(); i++) {
-                    embedding_oss << "0x" << std::hex << std::setw(4) << std::setfill('0') 
-                                  << temp_embedding_raw[i] << " ";
-                }
-                embedding_oss << std::dec << "\n";
-                
-                embedding_oss << "  First 10 embedding values (converted to float): ";
-                for (size_t i = 0; i < temp_embedding_raw.size(); i++) {
-                    embedding_oss << "0.0 ";  // 占位符
-                }
-                embedding_oss << "\n";
-            } else {
-                // 原有的 float32 处理
-                std::vector<float> temp_embedding(std::min(size_t(10), d));
-                size_t token_offset = tokens[0] * d;
-                
-                RUN_INFINI(infinirtMemcpy(temp_embedding.data(), 
-                                         rsrc.w_in_embd->data(token_offset),
-                                         sizeof(float) * temp_embedding.size(), 
-                                         INFINIRT_MEMCPY_D2H));
-                RUN_INFINI(infinirtDeviceSynchronize());
-                
-                embedding_oss << "  First 10 embedding values: ";
-                for (size_t i = 0; i < temp_embedding.size(); i++) {
-                    embedding_oss << std::scientific << temp_embedding[i] << " ";
-                }
-                embedding_oss << "\n";
-            }
-            write_debug_log(embedding_oss.str());
-        }
-    }
 
 
         /*
@@ -908,14 +791,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
         // Create input tokens tensor for debugging
         auto tokens_tensor = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
         RUN_INFINI(infinirtMemcpy(tokens_tensor->data(), tokens, sizeof(uint32_t) * ntok, INFINIRT_MEMCPY_H2D));
-        save_tensor_debug_f32(tokens_tensor, "input_ids", -1, "cpp");
-        
-        // 根据实际数据类型调用正确的保存函数
-        if (dt_logits == INFINI_DTYPE_F16) {
-            save_tensor_debug_f16(logits_in, "input_embeddings", -1, "cpp");
-        } else {
-            save_tensor_debug_f32(logits_in, "input_embeddings", -1, "cpp");
-        }
     }
     
         /*
@@ -1450,10 +1325,6 @@ workspace_size = std::max(workspace_size, temp_size);
          */
         
         // Debug: Save layer input (only for layer 0)
-        if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f16(logits_in, "input_hidden_states", layer);
-        }
-        
         // 1. 注意力
         
         /*
@@ -1475,7 +1346,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save attention norm output (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(logits_out, "attn_norm_output", layer);
         }     
         /*
          * Qwen3 注意力计算：分离 QKV + Q/K 归一化
@@ -1520,9 +1390,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save QKV projections (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(q_buf, "attn_q_proj_raw", layer);
-            save_tensor_debug_f32(k_buf, "attn_k_proj_raw", layer);
-            save_tensor_debug_f32(v_buf, "attn_v_proj_raw", layer);
             
             // Validate QKV projections before normalization
             validate_tensor_range(q_buf, "q_buf before normalization");
@@ -1586,8 +1453,6 @@ workspace_size = std::max(workspace_size, temp_size);
             clamp_tensor_inplace(q_norm_buf, -10.0f, 10.0f);
             clamp_tensor_inplace(k_norm_buf, -10.0f, 10.0f);
             
-            save_tensor_debug_f32(q_norm_buf, "attn_q_normed", layer);
-            save_tensor_debug_f32(k_norm_buf, "attn_k_normed", layer);
         }
         // ============================================================================
         // 第三步：按头应用 RoPE
@@ -1715,7 +1580,7 @@ workspace_size = std::max(workspace_size, temp_size);
             rsrc.w_attn_o_proj[layer]->data(), 
             1.0, idev == 0 ? 1.0 : 0.0, stream)); 
             // 残差：仅 rank 0 添加原始输入
-            //如果每个设备都添加完整的残差，最终结果会是：output = partial_outputs + ndev * residual  ❌ 错误！
+            // 如果每个设备都添加完整的残差，最终结果会是：output = partial_outputs + ndev * residual (错误)
 
         /*
          * 用于多设备推理的分布式 All-Reduce
@@ -1737,7 +1602,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save attention residual output (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(logits_in, "attn_residual_output", layer);
         }
 
 
@@ -1768,7 +1632,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save MLP norm output (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(logits_out, "mlp_norm_output", layer);
         }
             
         
@@ -1801,8 +1664,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save MLP Gate and Up projections
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(gate_buf, "mlp_gate_proj", layer);
-            save_tensor_debug_f32(up_buf, "mlp_up_proj", layer);
         }
         
         // 步骤 3: SwiGLU 激活 - 一次性完成 gate ⊙ SiLU(up)
@@ -1815,7 +1676,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save MLP intermediate (after SwiGLU) (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(gate_buf, "mlp_intermediate", layer);
         }
         
         // 步骤 4: Down 投影和残差连接
@@ -1858,7 +1718,6 @@ workspace_size = std::max(workspace_size, temp_size);
         
         // Debug: Save layer output (only for layer 0)
         if (g_debug_enabled && layer == 0) {
-            save_tensor_debug_f32(logits_in, "layer_output", layer);
         }
     }
     
@@ -1991,8 +1850,8 @@ workspace_size = std::max(workspace_size, temp_size);
     infiniopDestroyGemmDescriptor(desc_attn_o);               // 注意力输出投影
     infiniopDestroyRoPEDescriptor(desc_rope_q_single);               // 查询的 RoPE
     infiniopDestroyRoPEDescriptor(desc_rope_k_single);               // 键的 RoPE
-    infiniopDestroyRMSNormDescriptor(desc_q_norm_single);     // 单头查询归一化 ✅ 添加这行
-    infiniopDestroyRMSNormDescriptor(desc_k_norm_single);     // 单头键归一化 ✅ 添加这行
+    infiniopDestroyRMSNormDescriptor(desc_q_norm_single);     // 单头查询归一化
+    infiniopDestroyRMSNormDescriptor(desc_k_norm_single);     // 单头键归一化
     
     
     // 清理每请求注意力描述符
