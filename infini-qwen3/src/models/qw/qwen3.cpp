@@ -20,44 +20,10 @@
 #include <sys/stat.h>
 #endif
 
-/*
- * Debug utilities for comparing C++ vs Python implementations
- * These functions save tensor data to files for comparison
- */
-
-// Global debug flag and log file
-static bool g_debug_enabled = true;
-static std::ofstream debug_log_file;
-static std::mutex debug_log_mutex;
+static bool g_debug_enabled = false;
 
 void set_debug_mode(bool enabled) {
     g_debug_enabled = enabled;
-    
-    if (enabled && !debug_log_file.is_open()) {
-        // Create output directory
-        #ifdef _WIN32
-        _mkdir("output");
-        #else
-        mkdir("output", 0755);
-        #endif
-        
-        debug_log_file.open("output/qwen3_debug.log", std::ios::out | std::ios::trunc);
-        if (debug_log_file.is_open()) {
-            debug_log_file << "=== Qwen3 Debug Log Started ===\n" << std::flush;
-        }
-    } else if (!enabled && debug_log_file.is_open()) {
-        debug_log_file.close();
-    }
-}
-
-// Helper function to write debug messages to file
-void write_debug_log(const std::string& message) {
-    if (!g_debug_enabled) return;
-    
-    std::lock_guard<std::mutex> lock(debug_log_mutex);
-    if (debug_log_file.is_open()) {
-        debug_log_file << message << std::flush;
-    }
 }
 
 // Validation function to check tensor for extreme values
@@ -103,67 +69,16 @@ bool validate_tensor_range(const std::shared_ptr<Tensor> &tensor, const std::str
     }
     
     if (has_extreme && g_debug_enabled) {
-        std::ostringstream oss;
-        oss << "⚠ RANGE WARNING: " << name << " has extreme values:\n"
-            << "  Min: " << actual_min << ", Max: " << actual_max << "\n"
-            << "  NaN count: " << nan_count << ", Inf count: " << inf_count 
-            << " (in sample of " << sample_size << ")\n";
-        write_debug_log(oss.str());
+        printf("WARNING: %s has extreme values:\n", name.c_str());
+        printf("  Min: %e, Max: %e\n", actual_min, actual_max);
+        printf("  NaN count: %d, Inf count: %d (in sample of %zu)\n", 
+               nan_count, inf_count, sample_size);
     }
     
     return !has_extreme;
 }
 
-// Function to clamp tensor values to prevent overflow in subsequent operations
-void clamp_tensor_inplace(const std::shared_ptr<Tensor> &tensor, float min_val = -65504.0f, float max_val = 65504.0f) {
-    if (!tensor) return;
-    
-    auto shape = tensor->shape();
-    size_t total_size = 1;
-    for (auto dim : shape) {
-        total_size *= dim;
-    }
-    
-    // Get data as float pointer (assuming FP32 storage for intermediate computations)
-    float* data_ptr = static_cast<float*>(tensor->data());
-    
-    // Launch a simple clamping operation on device (this would need proper CUDA/device implementation)
-    // For now, copy to host, clamp, and copy back (inefficient but safe)
-    std::vector<float> host_data(total_size);
-    
-    // Copy to host
-    RUN_INFINI(infinirtMemcpy(host_data.data(), data_ptr, 
-                             total_size * sizeof(float), INFINIRT_MEMCPY_D2H));
-    RUN_INFINI(infinirtDeviceSynchronize());
-    
-    // Clamp values
-    bool clamped_any = false;
-    for (size_t i = 0; i < total_size; ++i) {
-        if (host_data[i] < min_val) {
-            host_data[i] = min_val;
-            clamped_any = true;
-        } else if (host_data[i] > max_val) {
-            host_data[i] = max_val;
-            clamped_any = true;
-        } else if (std::isnan(host_data[i]) || std::isinf(host_data[i])) {
-            host_data[i] = 0.0f;  // Replace NaN/Inf with zero
-            clamped_any = true;
-        }
-    }
-    
-    if (clamped_any) {
-        // Copy back to device
-        RUN_INFINI(infinirtMemcpy(data_ptr, host_data.data(), 
-                                 total_size * sizeof(float), INFINIRT_MEMCPY_H2D));
-        RUN_INFINI(infinirtDeviceSynchronize());
-        
-        if (g_debug_enabled) {
-            std::ostringstream oss;
-            oss << "⚠ Clamped extreme values in tensor to range [" << min_val << ", " << max_val << "]\n";
-            write_debug_log(oss.str());
-        }
-    }
-}
+
 
 template<typename T>
 void save_tensor_debug(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
@@ -814,18 +729,8 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     }
     
     if (g_debug_enabled && idev == 0) {
-        std::ostringstream oss;
-        oss << "✓ All tensor buffers allocated successfully\n"
-            << "  Memory pool usage: " << (total_memory_needed / (1024.0 * 1024.0)) << " MB total needed\n";
-        write_debug_log(oss.str());
-        
-        // Create output directory for debug files
-        #ifdef _WIN32
-        _mkdir("debug_output");
-        #else
-        mkdir("debug_output", 0755);
-        #endif
-        write_debug_log("✓ Debug output directory created/verified\n");
+        printf("Memory pool usage: %.2f MB total needed\n", 
+               (total_memory_needed / (1024.0 * 1024.0)));
     }
 
 
